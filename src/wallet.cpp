@@ -119,6 +119,22 @@ bool CWallet::AddCScript(const CScript& redeemScript)
     return CWalletDB(strWalletFile).WriteCScript(Hash160(redeemScript), redeemScript);
 }
 
+bool CWallet::AddWatchOnly(const CTxDestination &dest)
+{
+    if (!CCryptoKeyStore::AddWatchOnly(dest))
+        return false;
+    nTimeFirstKey = 1; // No birthday information for watch-only keys.
+    if (!fFileBacked)
+        return true;
+    return CWalletDB(strWalletFile).WriteWatchOnly(dest);
+}
+
+bool CWallet::LoadWatchOnly(const CTxDestination &dest)
+{
+    LogPrintf("Loaded %s!\n", CBitcoinAddress(dest).ToString().c_str());
+    return CCryptoKeyStore::AddWatchOnly(dest);
+}
+
 // optional setting to unlock wallet for staking only
 // serves to disable the trivial sendmoney when OS account compromised
 // provides no real security
@@ -606,7 +622,7 @@ void CWallet::EraseFromWallet(const uint256 &hash)
 }
 
 
-bool CWallet::IsMine(const CTxIn &txin) const
+isminetype CWallet::IsMine(const CTxIn &txin) const
 {
     {
         LOCK(cs_wallet);
@@ -615,11 +631,10 @@ bool CWallet::IsMine(const CTxIn &txin) const
         {
             const CWalletTx& prev = (*mi).second;
             if (txin.prevout.n < prev.vout.size())
-                if (IsMine(prev.vout[txin.prevout.n]))
-                    return true;
+                return IsMine(prev.vout[txin.prevout.n]);
         }
     }
-    return false;
+    return MINE_NO;
 }
 
 int64_t CWallet::GetDebit(const CTxIn &txin) const
@@ -1083,11 +1098,10 @@ int64_t CWallet::GetImmatureBalance() const
     return nTotal;
 }
 
-// populate vCoins with vector of spendable COutputs
+// populate vCoins with vector of available COutputs
 void CWallet::AvailableCoins(vector<COutput>& vCoins, bool fOnlyConfirmed, const CCoinControl *coinControl) const
 {
     vCoins.clear();
-
     {
         LOCK2(cs_main, cs_wallet);
         for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
@@ -1111,9 +1125,15 @@ void CWallet::AvailableCoins(vector<COutput>& vCoins, bool fOnlyConfirmed, const
                 continue;
 
             for (unsigned int i = 0; i < pcoin->vout.size(); i++)
-                if (!(pcoin->IsSpent(i)) && IsMine(pcoin->vout[i]) && pcoin->vout[i].nValue >= nMinimumInputValue &&
-                (!coinControl || !coinControl->HasSelected() || coinControl->IsSelected((*it).first, i)))
-                    vCoins.push_back(COutput(pcoin, i, nDepth));
+            {
+                isminetype mine = IsMine(pcoin->vout[i]);
+                if (!(pcoin->IsSpent(i)) && mine != MINE_NO &&
+                    !IsLockedCoin((*it).first, i) && pcoin->vout[i].nValue > 0 &&
+                    (!coinControl || !coinControl->HasSelected() || coinControl->IsSelected((*it).first, i)))
+                {
+                    vCoins.push_back(COutput(pcoin, i, pcoin->GetDepthInMainChain(), mine == MINE_SPENDABLE));
+                }
+            }
 
         }
     }
@@ -1149,9 +1169,50 @@ void CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSp
                 continue;
 
             for (unsigned int i = 0; i < pcoin->vout.size(); i++)
+            {
+                isminetype mine = IsMine(pcoin->vout[i]);
                 if (!(pcoin->IsSpent(i)) && IsMine(pcoin->vout[i]) && pcoin->vout[i].nValue >= nMinimumInputValue)
-                    vCoins.push_back(COutput(pcoin, i, nDepth));
+                {
+                    vCoins.push_back(COutput(pcoin, i, pcoin->GetDepthInMainChain(), mine == MINE_SPENDABLE));
+                }
+            }
         }
+    }
+}
+
+void CWallet::LockCoin(COutPoint& output)
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    setLockedCoins.insert(output);
+}
+
+void CWallet::UnlockCoin(COutPoint& output)
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    setLockedCoins.erase(output);
+}
+
+void CWallet::UnlockAllCoins()
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    setLockedCoins.clear();
+}
+
+bool CWallet::IsLockedCoin(uint256 hash, unsigned int n) const
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    COutPoint outpt(hash, n);
+
+    return (setLockedCoins.count(outpt) > 0);
+}
+
+void CWallet::ListLockedCoins(std::vector<COutPoint>& vOutpts)
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    for (std::set<COutPoint>::iterator it = setLockedCoins.begin();
+         it != setLockedCoins.end(); it++) {
+        COutPoint outpt = (*it);
+        vOutpts.push_back(outpt);
     }
 }
 
@@ -1242,8 +1303,11 @@ bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, 
 
     random_shuffle(vCoins.begin(), vCoins.end(), GetRandInt);
 
-    BOOST_FOREACH(COutput output, vCoins)
+    BOOST_FOREACH(const COutput &output, vCoins)
     {
+        if (!output.fSpendable)
+            continue;
+
         const CWalletTx *pcoin = output.tx;
 
         if (output.nDepth < (pcoin->IsFromMe() ? nConfMine : nConfTheirs))
@@ -1340,6 +1404,8 @@ bool CWallet::SelectCoins(int64_t nTargetValue, unsigned int nSpendTime, set<pai
     {
         BOOST_FOREACH(const COutput& out, vCoins)
         {
+            if(!out.fSpendable)
+                continue;
             nValueRet += out.tx->vout[out.i].nValue;
             setCoinsRet.insert(make_pair(out.tx, out.i));
         }
@@ -1633,7 +1699,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         for (unsigned int n=0; n<min(nSearchInterval,(int64_t)nMaxStakeSearchInterval) && !fKernelFound && pindexPrev == pindexBest; n++)
         {
             boost::this_thread::interruption_point();
-            // Search backward in time from the given txNew timestamp 
+            // Search backward in time from the given txNew timestamp
             // Search nSearchInterval seconds back up to nMaxStakeSearchInterval
             COutPoint prevoutStake = COutPoint(pcoin.first->GetHash(), pcoin.second);
             int64_t nBlockTime;
@@ -1932,6 +1998,47 @@ bool CWallet::SetAddressBookName(const CTxDestination& address, const string& st
         return false;
     return CWalletDB(strWalletFile).WriteName(CBitcoinAddress(address).ToString(), strName);
 }
+
+// bool CWallet::SetAddressBook(const CTxDestination& address, const string& strName, const string& strPurpose)
+// {
+//     AssertLockHeld(cs_wallet); // mapAddressBook
+//     std::map<CTxDestination, CAddressBookData>::iterator mi = mapAddressBook.find(address);
+//     mapAddressBook[address].name = strName;
+//     if (!strPurpose.empty()) /* update purpose only if requested */
+//         mapAddressBook[address].purpose = strPurpose;
+//     NotifyAddressBookChanged(this, address, strName, ::IsMine(*this, address),
+//             mapAddressBook[address].purpose,
+//             (mi == mapAddressBook.end()) ?  CT_NEW : CT_UPDATED);
+//     if (!fFileBacked)
+//         return false;
+//     if (!strPurpose.empty() && !CWalletDB(strWalletFile).WritePurpose(CBitcoinAddress(address).ToString(), strPurpose))
+//         return false;
+//     return CWalletDB(strWalletFile).WriteName(CBitcoinAddress(address).ToString(), strName);
+// }
+
+// should implement TODO pr
+// bool CWallet::DelAddressBook(const CTxDestination& address)
+// {
+//
+//     AssertLockHeld(cs_wallet); // mapAddressBook
+//
+//     if(fFileBacked)
+//     {
+//         // Delete destdata tuples associated with address
+//         std::string strAddress = CBitcoinAddress(address).ToString();
+//         BOOST_FOREACH(const PAIRTYPE(string, string) &item, mapAddressBook[address].destdata)
+//         {
+//             CWalletDB(strWalletFile).EraseDestData(strAddress, item.first);
+//         }
+//     }
+//
+//     mapAddressBook.erase(address);
+//     NotifyAddressBookChanged(this, address, "", ::IsMine(*this, address), "", CT_DELETED);
+//     if (!fFileBacked)
+//         return false;
+//     CWalletDB(strWalletFile).ErasePurpose(CBitcoinAddress(address).ToString());
+//     return CWalletDB(strWalletFile).EraseName(CBitcoinAddress(address).ToString());
+// }
 
 bool CWallet::DelAddressBookName(const CTxDestination& address)
 {

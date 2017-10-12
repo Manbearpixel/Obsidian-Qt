@@ -101,6 +101,12 @@ bool CWalletDB::WriteCScript(const uint160& hash, const CScript& redeemScript)
     return Write(std::make_pair(std::string("cscript"), hash), redeemScript, false);
 }
 
+bool CWalletDB::WriteWatchOnly(const CTxDestination &dest)
+{
+    nWalletDBUpdated++;
+    return Write(std::make_pair(std::string("watch"), CBitcoinAddress(dest).ToString()), '1');
+}
+
 bool CWalletDB::WriteBestBlock(const CBlockLocator& locator)
 {
     nWalletDBUpdated++;
